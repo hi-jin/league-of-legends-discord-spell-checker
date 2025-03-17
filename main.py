@@ -2,6 +2,10 @@ import discord
 from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 import os
+import subprocess
+import datetime
+import time
+import whisper
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -11,7 +15,8 @@ intents.message_content = True
 
 discord.opus._load_default()
 
-# 유저별 음성 데이터를 저장할 딕셔너리 (user_id: [음성 청크, ...])
+# 유저별 음성 데이터를 저장할 딕셔너리
+# 구조: { user_id: {'name': user_name, 'chunks': [(timestamp, audio_chunk), ...] } }
 user_voice_data = {}
 
 
@@ -32,21 +37,18 @@ class Testing(commands.Cog):
     async def join(self, ctx):
         """
         음성 채널에 연결하여 들어오는 음성 데이터를 유저별로 저장합니다.
+        각 청크마다 녹음 시각과 사용자 이름을 함께 저장합니다.
         """
 
         def callback(user, data: voice_recv.VoiceData):
             print(f"Got packet from {user}")
-            # voice_recv.VoiceData 객체의 data 필드에 음성 바이트 데이터가 있다고 가정
+            # PCM 데이터를 사용
             audio_bytes = data.pcm
-
-            # 해당 유저의 데이터가 없으면 리스트를 초기화
+            timestamp = time.time()  # 현재 시각 (epoch seconds)
             if user.id not in user_voice_data:
-                user_voice_data[user.id] = []
+                user_voice_data[user.id] = {"name": user.name, "chunks": []}
+            user_voice_data[user.id]["chunks"].append((timestamp, audio_bytes))
 
-            # 음성 청크를 저장
-            user_voice_data[user.id].append(audio_bytes)
-
-        # 음성 채널에 접속한 경우에만 실행
         if ctx.author.voice and ctx.author.voice.channel:
             vc = await ctx.author.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
             vc.listen(voice_recv.BasicSink(callback))
@@ -57,24 +59,24 @@ class Testing(commands.Cog):
     @commands.command()
     async def play(self, ctx):
         """
-        저장된 음성 데이터를 불러와서 임시 파일에 저장 후, 음성 채널에서 재생합니다.
+        저장된 음성 데이터를 불러와 임시 파일에 저장 후, 음성 채널에서 재생합니다.
+        여기서는 명령어를 실행한 유저의 데이터를 사용합니다.
         """
-        # 명령어를 실행한 유저의 저장된 데이터가 있는지 확인
-        if ctx.author.id not in user_voice_data or not user_voice_data[ctx.author.id]:
+        if (
+            ctx.author.id not in user_voice_data
+            or not user_voice_data[ctx.author.id]["chunks"]
+        ):
             await ctx.send("저장된 음성 데이터가 없습니다.")
             return
 
-        # 모든 청크를 하나의 바이트열로 결합
-        combined_audio = b"".join(user_voice_data[ctx.author.id])
-        temp_filename = f"{ctx.author.id}_voice.raw"
-
-        # 결합한 음성 데이터를 임시 파일에 저장
-        with open(temp_filename, "wb") as f:
+        chunks = sorted(user_voice_data[ctx.author.id]["chunks"], key=lambda x: x[0])
+        combined_audio = b"".join(chunk for (_, chunk) in chunks)
+        raw_filename = f"{ctx.author.id}_voice.raw"
+        with open(raw_filename, "wb") as f:
             f.write(combined_audio)
 
         await ctx.send("저장된 음성 데이터를 사용합니다.")
 
-        # 이미 음성 채널에 연결되어 있으면 해당 연결을 재사용
         if ctx.voice_client is None:
             if ctx.author.voice and ctx.author.voice.channel:
                 vc = await ctx.author.voice.channel.connect()
@@ -84,11 +86,87 @@ class Testing(commands.Cog):
         else:
             vc = ctx.voice_client
 
-        # 입력 파일이 raw PCM 데이터임을 FFmpeg에 알려주기 위해 before_options 사용
+        # before_options를 사용하여 FFmpeg에게 raw PCM 포맷임을 알림
         source = discord.FFmpegPCMAudio(
-            temp_filename, before_options="-f s16le -ar 48000 -ac 2"
+            raw_filename, before_options="-f s16le -ar 48000 -ac 2"
         )
         vc.play(source)
+
+    @commands.command()
+    async def transcribe(self, ctx):
+        """
+        저장된 음성 데이터를 OpenAI Whisper로 텍스트로 변환합니다.
+        각 유저의 발화는 녹음 시작 시각(offset)과 Whisper의 상대 시간 정보를 더해 실제 시각으로 변환됩니다.
+        이후 여러 유저의 발화를 실제 시간 순으로 정렬하여 대화 형태로 출력합니다.
+        """
+        if not user_voice_data:
+            await ctx.send("저장된 음성 데이터가 없습니다.")
+            return
+
+        await ctx.send(
+            "Whisper를 사용하여 음성 데이터를 텍스트로 변환 중입니다. 잠시만 기다려주세요..."
+        )
+        model = whisper.load_model("base")
+        all_segments = (
+            []
+        )  # 각 발화: { 'start': 실제 시작시간, 'end': 실제 종료시간, 'user': 사용자, 'text': 전사 내용 }
+
+        for user_id, data_dict in user_voice_data.items():
+            user_name = data_dict["name"]
+            chunks = sorted(data_dict["chunks"], key=lambda x: x[0])
+            offset = chunks[0][0]  # 해당 유저의 녹음 시작 시각 (epoch seconds)
+            combined_audio = b"".join(chunk for (_, chunk) in chunks)
+            raw_filename = f"{user_id}_voice.raw"
+            wav_filename = f"{user_id}_voice.wav"
+            with open(raw_filename, "wb") as f:
+                f.write(combined_audio)
+
+            # raw PCM 파일을 WAV로 변환 (ffmpeg)
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                raw_filename,
+                wav_filename,
+            ]
+            subprocess.run(ffmpeg_cmd, check=True)
+
+            result = model.transcribe(wav_filename)
+            for segment in result["segments"]:
+                # Whisper의 시간은 파일 시작 기준이므로 offset을 더해 실제 시간으로 변환
+                actual_start = offset + segment["start"]
+                actual_end = offset + segment["end"]
+                # 실제 시간을 HH:MM:SS 형식으로 변환
+                start_str = datetime.datetime.fromtimestamp(actual_start).strftime(
+                    "%H:%M:%S"
+                )
+                end_str = datetime.datetime.fromtimestamp(actual_end).strftime(
+                    "%H:%M:%S"
+                )
+                text = segment["text"].strip()
+                all_segments.append(
+                    {
+                        "start": actual_start,
+                        "end": actual_end,
+                        "user": user_name,
+                        "start_str": start_str,
+                        "end_str": end_str,
+                        "text": text,
+                    }
+                )
+
+        # 모든 유저의 발화를 실제 시작 시간 순으로 정렬
+        all_segments.sort(key=lambda x: x["start"])
+        final_transcription = "Transcription:\n"
+        for segment in all_segments:
+            final_transcription += f"[{segment['start_str']} - {segment['end_str']}] **{segment['user']}**: {segment['text']}\n"
+        await ctx.send(final_transcription)
 
     @commands.command()
     async def stop(self, ctx):
